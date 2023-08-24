@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <script src="brython.js">
+    </script>
+    <script src="brython_stdlib.js">
+    </script>
+    <link rel="stylesheet" href="bootstrap.min.css">
+
+    <title>GameBoy GameShark to GameGenie codes converter by BestPig</title>
+</head>
+
+<body onload="brython()">
+
+<div id="loading" style="margin: 30px">
+Loading...
+</div>
+
+<div id="main" style="display: none">
+    <div class="container">
+        <div class="py-5 text-center">
+            <img class="d-block mx-auto mb-4" src="avatar.jpg" style="border-radius: 20%;" alt="" width="72" height="72">
+            <h2>GameBoy GameShark to GameGenie codes converter</h2>
+        </div>
+
+        <div>
+            <form>
+                <div class="form-group">
+                    <label for="gb_rom_input">GameBoy ROM</label>
+                    <input type="file" class="form-control" id="gb_rom_input">
+                </div>
+                <div class="form-group">
+                    <label for="gs_codes">Game Shark codes</label>
+                    <textarea rows="6" id="gs_codes" class="form-control text-monospace"></textarea>
+                </div>
+            </form>
+        </div>
+
+        <div>
+            <div class="form-group">
+                <button id="convert-btn" type="button" class="btn btn-primary">Generate GameGenie Codes</button>
+                <button id="download-btn" type="button" class="btn btn-primary">Download patched ROM with cheats</button>
+            </div>
+        </div>
+
+        <div>
+            <div class="form-group">
+                <label for="codes">Game Genie codes</label>
+                <textarea rows="16" id="codes" class="form-control text-monospace" readonly></textarea>
+            </div>
+        </div>
+
+
+        <script>
+            document.getElementById('gb_rom_input').value= null;
+        </script>
+
+    </form>
+
+</div>
+
+<script type="text/python">
+
+from browser import bind, window, document, alert
+from javascript import JSObject
+from io import BytesIO
+import struct
+import binascii
+from base64 import b64decode, b64encode
+
+
+document["loading"].style.display = 'none'
+document["main"].style.display = 'inline'
+
+
+load_btn = document["gb_rom_input"]
+
+orig_rom = None
+
+def decode_gs_codes(codes):
+    raw_codes = {}
+    for code in codes:
+        code = code.strip()
+        if len(code) != 8:
+            continue
+        bankno, value = code[0:2], code[2:4]
+        addr = code[6:] + code[4:6]
+        #if bankno != '01':
+        #    continue
+        try:
+            value = int(value, 16)
+            addr = int(addr, 16)
+        except:
+            continue
+        if bankno not in raw_codes:
+            raw_codes[bankno] = []
+        raw_codes[bankno].append((value, addr))
+
+    return raw_codes
+
+def asm_jp(addr):
+    return b'\xc3' + struct.pack('<H', addr)
+
+def asm_ld(arg1, arg2):
+    if arg1 == 'a':
+        return b'\x3e' + struct.pack('<B', arg2)
+    elif arg2 == 'a':
+        return b'\xea' + struct.pack('<H', arg1)
+    else:
+        raise Exception("Not supported")
+
+def search_for_free_space(data, size, free_char=0x00):
+    size += 6
+
+    a = 0
+    c = 0
+    for i in range(0x3fff - 1, -1, -1):
+        v = data[i]
+        if v == free_char:
+            c += 1
+        else:
+            c = 0
+        if c == size:
+            return i + 3
+    return None
+
+def search_for_jump(data):
+    # Check if LCDInterrupt is used, privilege this
+    # because vblank hook seems it conflict with hook in EverDrive
+    if data[0x48] == 0xc3:
+        return 0x48
+    vblank_handler = data[0x40:0x47]
+    if vblank_handler.count(b'\xc3') != 1:
+        return None
+    return 0x40 + vblank_handler.index(b'\xc3')
+
+def rl8(n, shift):
+    return ((n << shift) | (n >> (8 - shift))) & 0xff
+
+
+def game_genie_encode(val, addr, orig=None):
+    print("addr: %x, val: %x, orig: %x" % (addr, val, orig))
+    code = '%02X' % val
+    code += '%X-%02X%X' % ((addr & 0xf00) >> 8, addr & 0xff, 0xf - (addr >> 12))
+
+    if orig is not None:
+        num = rl8(orig ^ 0x45, 2) ^ 0xff
+        chk = ((num & 0xf0) >> 4) ^ 0x08
+        code += '-%X%X%X' % ((num & 0xf0) >> 4, chk, num & 0x0f)
+
+    return code
+
+def compute(rom, raw_codes):
+    new_rom = bytearray(rom[::])
+
+    vblank_jump_addr = None
+    vblank_jump_addr = search_for_jump(rom)
+    if not vblank_jump_addr:
+        alert("Error: Unsupported ROM, no vblank jump found")
+        rom = None
+        return
+
+
+    orig_jump = rom[vblank_jump_addr:vblank_jump_addr+3]
+
+    payload =  b'\xf5'             # push af
+
+    for bank_no, codes in raw_codes.items():
+        if bank_no == '01':
+            for value, addr in codes:
+                payload += asm_ld('a', value)   # ld a, {value}
+                payload += asm_ld(addr, 'a')    # ld ({addr}), a
+
+        elif bank_no.startswith('9'):
+            payload += b'\x3e\x0a'      # LD A, $0A
+            payload += b'\xea\x00\x00'  # LD $0000, A
+
+            b = (int(bank_no[1:])).to_bytes(1, byteorder='little')
+            payload += b'\x3e' + b      # LD A, BANK_NO
+
+            payload += b'\xea\x00\x40'  # LD $4000, A
+
+            for value, addr in codes:
+                payload += asm_ld('a', value)   # ld a, {value}
+                payload += asm_ld(addr, 'a')    # ld ({addr}), a
+
+            payload += b'\xaf'          # XOR A
+            payload += b'\xea\x00\x00'  # LD $0000, A
+
+    payload += b'\xf1'             # pop af
+    payload += orig_jump           # jp $XX
+    
+    codes = []
+
+    # Trying different method to find free space
+    # Some ROM have 0x00 (nop) or 0xff (non init)
+    payload_offset = search_for_free_space(rom, len(payload)) or search_for_free_space(rom, len(payload), free_char=0xff)
+    if not payload_offset:
+        alert("Error: No free space found")
+        return
+
+    new_jmp = asm_jp(payload_offset)
+    
+    for i in range(3):
+        old = orig_jump[i]
+        new = new_jmp[i]
+    
+        if old != new:
+            #new_rom.seek(i + vblank_jump_addr)
+            #new_rom.write(bytes([new]))
+            new_rom[i + vblank_jump_addr] = new
+            codes.append(game_genie_encode(new, i + vblank_jump_addr, orig=old))
+
+    for i in range(payload_offset, payload_offset + len(payload)):
+        old = rom[i]
+        new = payload[i - payload_offset]
+    
+        if old != new:
+            new_rom[i] = new
+            codes.append(game_genie_encode(new, i, orig=old))
+
+    return codes, new_rom
+
+@bind(load_btn, "input")
+def file_read(ev):
+
+    def onload(event):
+        global orig_rom
+
+        document["codes"].textContent = ""
+
+        # Cheat using b64, seems readAsDataURL is the only one that is working correctly
+        # with brython on file with special characters
+        data = event.target.result.split(',')
+        if len(data) != 2 or not data[1]:
+            alert("Unknown file")
+            return
+        orig_rom = b64decode(data[1])
+
+    file = load_btn.files[0]
+    reader = window.FileReader.new()
+    reader.readAsDataURL(file)
+    reader.fileName = file.name
+    reader.bind("load", onload)
+
+
+def convert_button(ev):
+    document['codes'].textContent = ''
+
+    gs_codes = document["gs_codes"].value
+    raw_codes = decode_gs_codes(gs_codes.split('\n'))
+
+    if not raw_codes:
+        alert("Valid GameShark code is mandatory")
+        return
+
+    if not orig_rom:
+        alert("Valid GB ROM file is mandatory")
+        return
+
+    codes, _ = compute(orig_rom, raw_codes)
+    print(codes)
+    document["codes"].textContent = "\n".join(codes)
+
+def download_button(ev):
+    document['codes'].textContent = ''
+
+    gs_codes = document["gs_codes"].value
+    raw_codes = decode_gs_codes(gs_codes.split('\n'))
+
+    if not raw_codes:
+        alert("Valid GameShark code is mandatory")
+        return
+
+    if not orig_rom:
+        alert("Valid GB ROM file is mandatory")
+        return
+
+    codes, new_rom = compute(orig_rom, raw_codes)
+
+    # Don't know why, without this cheat, file integrity is not preserved
+    rom = new_rom.hex()
+    rom = window.hex_to_ascii(rom)
+
+    blobConfig = window.Blob.new(
+        [ rom ], 
+        { type: 'application/x-gameboy-rom' }
+    )
+
+    window.saveByteArray('test.gb', rom)
+
+document['convert-btn'].bind("click", convert_button)
+document['download-btn'].bind("click", download_button)
+
+</script>
+
+<script>
+window.hex_to_ascii = function(hex) {
+    var bytes = new Uint8Array(Math.ceil(hex.length / 2));
+    for (var i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return bytes;
+}
+
+window.saveByteArray = function(reportName, byte) {
+    var blob = new File([byte.buffer], {type: "application/octet-stream"});
+    var link = document.createElement('a');
+    link.href = window.URL.createObjectURL(blob);
+    var fileName = reportName;
+    link.download = fileName;
+    link.click();
+    URL.revokeObjectURL(link.href);
+};
+</script>
+</body>
+
+</html>
